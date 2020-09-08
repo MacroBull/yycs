@@ -6,7 +6,7 @@ Created on Fri Aug  9 11:20:32 2019
 @author: Macrobull
 """
 
-from __future__ import absolute_import, division, unicode_literals
+from __future__ import division, unicode_literals # absolute_import(tqdm_color_logging)
 
 import argparse, logging, shutil
 import yaml
@@ -31,7 +31,8 @@ DEFAULT_LOGGING_FORMAT :str = (
         '%(name)s::%(funcName)s @ %(filename)s:%(lineno)d: %(message)s'
         )
 
-state = dict()
+
+state :dict = dict()
 
 
 def is_listy(obj:'Any')->bool:
@@ -70,7 +71,7 @@ def dict2obj(d:'Mapping[str, Any]',
     if mutable keys wanted, try EasyDict
     """
 
-    d_ = dict()
+    d_ = dict() # type(d)()
     for k, v in d.items():
         for s in escapes:
             k = k.replace(s, '_')
@@ -150,7 +151,7 @@ def on_path(func:ConfigTransform, path:str,
     r"""call `func` at `path` in `config`"""
 
     @wraps(func)
-    def wrapped(config, *fargs, **fkwargs):
+    def _wrapped(config, *args_, **kwargs_):
         config = config.copy()
         obj, po, pk = config, None, None
         if path:
@@ -158,9 +159,9 @@ def on_path(func:ConfigTransform, path:str,
                 try:
                     if is_listy(obj):
                         key = int(key) # throw ValueError
-                    if is_dict(obj[key]): # throw KeyError, IndexError
+                    if is_dict(obj[key]): # throw LookupError
                         obj[key] = obj[key].copy()
-                except (ValueError, KeyError, IndexError):
+                except (ValueError, LookupError):
                     logger = state.get('logger')
                     if logger is not None:
                         logger.warning('bad index %s for %s, transform skipped',
@@ -169,7 +170,9 @@ def on_path(func:ConfigTransform, path:str,
                 else:
                     po, pk = obj, key
                     obj = obj[key]
-        ret = func(obj, *fargs, **fkwargs)
+
+        kwargs_.update(kwargs)
+        ret = func(obj, *(args + args_), **kwargs_)
         if po is None:
             config = ret
         else:
@@ -177,8 +180,8 @@ def on_path(func:ConfigTransform, path:str,
         return config
 
     func_name = get_func_name(func)
-    wrapped.__name__ = f'{func_name}(@path={path})'
-    return wrapped
+    _wrapped.__name__ = f'{func_name}(@path={path})'
+    return _wrapped
 
 
 def setup_global_logging(
@@ -188,7 +191,7 @@ def setup_global_logging(
         **kwargs)->ConfigDict:
     r"""setup global logging level according to "debug" option in `config`"""
 
-    import sys
+    import logging.handlers, sys
 
     logging_level = logging_level or (logging.DEBUG if config['debug'] else logging.INFO)
 
@@ -203,14 +206,14 @@ def setup_global_logging(
     if 'filename' not in kwargs:
         path = config.get('path')
         log_dir = path and path.get('log_dir')
-        if log_dir and log_dir.is_dir(): 
+        if log_dir and log_dir.is_dir():
             handler = logging.handlers.TimedRotatingFileHandler(
                 (log_dir / PROGRAM_NAME).with_suffix('.log'),
                 when='D', backupCount=5)
             handler.setFormatter(logging.Formatter(fmt=logging_format, datefmt='%H:%M:%S'))
             logging.root.addHandler(handler)
 
-    state['logger'] = logging.getLogger(__name__)
+    state['logger'] = logging.getLogger(name=__name__)
 
     return config
 
@@ -221,17 +224,18 @@ def mkdirs(config:ConfigDict,
            **kwargs)->ConfigDict:
     r"""create directories for 'Path's in `config`"""
 
-    def inner(d):
+    def _inner(d):
         for k, v in d.items():
             if is_dict(v):
-                inner(v)
+                _inner(v)
                 continue
+
             if isinstance(v, (Path, str)) and k.endswith(key_endswith):
                 v = Path(v)
-                if v.is_absolute(): # only resolved
+                if v.is_absolute() and not v.is_dir(): # only resolved
                     shutil.os.makedirs(v, exist_ok=True)
 
-    inner(config)
+    _inner(config)
     return config
 
 
@@ -246,23 +250,40 @@ def convert_rel_path(
     base_dir = config[base_key]
     assert isinstance(base_dir, Path), f'base_dir({base_dir}) is not a Path'
 
-    def inner(d):
+    def _inner(d):
         r = type(d)()
         for k, v in d.items():
             if is_dict(v):
-                r[k] = inner(v)
+                r[k] = _inner(v)
                 continue
+
             if k.count(rel_key) != 1 or not isinstance(v, (Path, str)):
                 r[k] = v
                 continue
+
             v_ = Path(v)
             if v_.is_absolute():
                 r[k] = v
                 continue
+
             r[k.replace(rel_key, '_')] = base_dir / v
+
         return r
 
-    return inner(config)
+    return _inner(config)
+
+
+def log_config(config:ConfigDict,
+               *args,
+               prefix:str='launch with config',
+               **kwargs)->ConfigDict:
+    r"""log `config` itself"""
+
+    logger = state.get('logger')
+    if logger is not None:
+        logger.info(prefix + ':\n\t%s', config)
+
+    return config
 
 
 def resolve_args(
@@ -277,13 +298,14 @@ def resolve_args(
     `config_cls` can be other types like EasyDict to be used instead of namedtuple as config
     """
 
-    def recurse_update(d, s):
+    def _recurse_update(d, s):
         for k, v in s.items():
             if is_dict(v):
                 v_ = d.get(k)
                 if is_dict(v_):
-                    recurse_update(v_, v)
+                    _recurse_update(v_, v)
                     continue
+
             d[k] = v
 
     config = dict()
@@ -292,11 +314,12 @@ def resolve_args(
         config = yaml.load(open(default), Loader=ConfigLoader) or dict()
 
     config_ = yaml.load(open(getattr(args, config_role)), Loader=ConfigLoader) or dict()
-    recurse_update(config, config_)
+    _recurse_update(config, config_)
 
-    for k, v in args.__dict__.items():
+    for k, v in vars(args).items():
         if k in ('args', ):
             continue
+
         config[k] = v
 
     for arg in getattr(args, args_role):
@@ -315,6 +338,7 @@ def resolve_args(
                         obj = obj_[key] = dict() # throw TypeError
             except (ValueError, IndexError, AttributeError, TypeError):
                 raise ValueError(f'bad index {key} for {obj} in arg {path}')
+
         key = keys[-1]
         try:
             if is_listy(obj):
@@ -336,9 +360,9 @@ def resolve_args(
 def get_transforms()->ConfigTransforms:
     r"""get the default tfms for config"""
 
-    return (on_path(convert_rel_path, 'path'),
-            on_path(mkdirs, 'path'),
+    return (on_path(mkdirs, 'path'),
             setup_global_logging,
+            log_config,
             )
 
 
@@ -358,7 +382,5 @@ def get_config(
 if __name__ == '__main__':
     from easydict import EasyDict
 
-    config = get_config(
-            tfms=(on_path(mkdirs, 'path'), setup_global_logging),
-            config_cls=EasyDict)
+    config = get_config(tfms=get_transforms(), config_cls=EasyDict)
     logging.getLogger().info('config:\n\t%s', config)
