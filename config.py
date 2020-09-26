@@ -27,12 +27,14 @@ DELIMITER_PATH :str = '.'
 
 PROGRAM_NAME           :str = shutil.os.path.basename(shutil.sys.argv[0])
 DEFAULT_LOGGING_FORMAT :str = (
-        '[%(levelname)8s](%(asctime)8s)<%(process)5d> '
-        '%(name)s::%(funcName)s @ %(filename)s:%(lineno)d: %(message)s'
-        )
-
+    '[%(levelname)8s](%(asctime)8s)<%(process)5d> '
+    '%(name)s::%(funcName)s @ %(filename)s:%(lineno)d: %(message)s'
+)
 
 state :dict = dict()
+
+
+### utils ###
 
 
 def is_listy(obj:'Any')->bool:
@@ -61,17 +63,20 @@ def recurse(func:'Callable', obj:'Any',
 def get_func_name(func:'Callable')->str:
     r"""get name of `func`, a 'function', 'partial' or 'callable' class"""
 
-    return getattr(func, '__name__', getattr(getattr(func, 'func', type(func)), '__name__'))
+    name = getattr(func, '__name__', None)
+    if name is None:
+        name = get_func_name(getattr(func, 'func', type(func)))
+    return name
 
 
 def dict2obj(d:'Mapping[str, Any]',
              cls_name:str='Namespace', escapes:str='-')->'Any':
     r"""
-    'dict' to read-only fields recursively
+    convert 'dict' to read-only fields recursively
     if mutable keys wanted, try EasyDict
     """
 
-    d_ = dict() # type(d)()
+    d_ = dict() # type(d)(), built-in dict is ordered, that's enougth
     for k, v in d.items():
         for s in escapes:
             k = k.replace(s, '_')
@@ -83,30 +88,7 @@ def dict2obj(d:'Mapping[str, Any]',
     return cls(**d_)
 
 
-def parse_args(
-        args:'Optional[Sequence[str]]'=None,
-        default_config:str='configs/default', description:str=PROGRAM_NAME)->argparse.Namespace:
-    r"""the default parse_args"""
-
-    parser = argparse.ArgumentParser(
-            description=description,
-            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-            )
-    parser.add_argument(
-            '--config', '-c', default=f'{default_config}.yaml', # required=True,
-            help='path to config.yaml',
-            )
-    parser.add_argument(
-            '--default', '-f', default=f'{default_config}.yaml',
-            help='path to fallback default.yaml',
-            )
-    parser.add_argument(
-            '--debug', '-d', action='store_true',
-            help='enable debug logging and checking',
-            )
-    parser.add_argument('args', nargs=argparse.REMAINDER)
-    args = parser.parse_args(args)
-    return args
+### YAML tag extensions ###
 
 
 class ConfigConstructor(SafeConstructor):
@@ -144,6 +126,9 @@ def construct_tensor(
 
 ConfigConstructor.add_constructor('!path', construct_path)
 ConfigConstructor.add_constructor('!tensor', construct_tensor)
+
+
+### transforms ###
 
 
 def on_path(func:ConfigTransform, path:str,
@@ -193,7 +178,8 @@ def setup_global_logging(
 
     import logging.handlers, sys
 
-    logging_level = logging_level or (logging.DEBUG if config['debug'] else logging.INFO)
+    if logging_level is None:
+        logging_level = logging.DEBUG if config['debug'] else logging.INFO
 
     try:
         from tqdm_color_logging import basicConfig
@@ -286,12 +272,40 @@ def log_config(config:ConfigDict,
     return config
 
 
+### arguments parsing ###
+
+
+def parse_args(
+        args:'Optional[Sequence[str]]'=None,
+        default_config:str='configs/default', description:str=PROGRAM_NAME)->argparse.Namespace:
+    r"""the default parse_args"""
+
+    parser = argparse.ArgumentParser(
+        description=description,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        '--config', '-c', default=f'{default_config}.yaml', # required=True,
+        help='path to config.yaml',
+    )
+    parser.add_argument(
+        '--default', '-f', default=f'{default_config}.yaml',
+        help='path to fallback default.yaml',
+    )
+    parser.add_argument(
+        '--debug', '-d', action='store_true',
+        help='enable debug logging and checking',
+    )
+    parser.add_argument('args', nargs=argparse.REMAINDER)
+    args = parser.parse_args(args)
+    return args
+
+
 def resolve_args(
         args:argparse.Namespace,
         tfms:ConfigTransforms=(setup_global_logging, ),
         config_role:str='config', default_role:str='default', args_role:str='args',
-        config_cls:'Optional[type]'=None,
-        )->'Uniont[config, EasyDict]':
+        config_cls:'Optional[type]'=None)->'Union[config, EasyDict]':
     r"""
     load, resolve and merge from YAML config file
     `tfms`(transforms): convert_rel_path, mkdirs, setup_global_logging ...
@@ -311,9 +325,14 @@ def resolve_args(
     config = dict()
     default = getattr(args, default_role, None)
     if default and shutil.os.path.isfile(default):
-        config = yaml.load(open(default), Loader=ConfigLoader) or dict()
+        config = yaml.load(open(default), Loader=ConfigLoader)
+        config = dict() if config is None else config
+        assert isinstance(config, dict)
 
-    config_ = yaml.load(open(getattr(args, config_role)), Loader=ConfigLoader) or dict()
+    config_ = yaml.load(open(getattr(args, config_role)), Loader=ConfigLoader)
+    config_ = dict() if config_ is None else config_
+    assert isinstance(config_, dict)
+
     _recurse_update(config, config_)
 
     for k, v in vars(args).items():
@@ -324,7 +343,7 @@ def resolve_args(
 
     for arg in getattr(args, args_role):
         path, _, value = arg.partition(DELIMITER_ARG)
-        value = yaml.load(value, Loader=ConfigLoader) or True # HINT: true for switch-on
+        value = yaml.load(value, Loader=ConfigLoader) if value else True # HINT: switch-on
         keys = path.split('.')
         obj = config
         for key in keys[:-1]:
@@ -355,6 +374,9 @@ def resolve_args(
         return dict2obj(config, 'config')
 
     return config_cls(config)
+
+
+### all-in-one calls ###
 
 
 def get_transforms()->ConfigTransforms:
